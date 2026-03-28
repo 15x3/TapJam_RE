@@ -1,6 +1,6 @@
 -- ============================================================================
 -- RE:Flip - 翻转重启
--- 重力翻转俄罗斯方块：点击翻转重力，消行重启到对面
+-- 经典俄罗斯方块 + 重力翻转 + 消行重启到对面
 -- 24h Game Jam | Theme: RE (Restart)
 -- ============================================================================
 
@@ -11,65 +11,168 @@ local UI = require("urhox-libs/UI")
 -- ============================================================================
 local CONFIG = {
     Title = "RE:Flip",
-    -- 网格尺寸
-    COLS = 8,
-    ROWS = 16,
-    CELL_SIZE = 0,        -- 运行时根据屏幕计算
-    -- 游戏节奏
-    DROP_INTERVAL = 0.6,  -- 方块下落间隔（秒）
-    DROP_SPEED_MIN = 0.15, -- 最快速度
-    SPEED_UP_RATE = 0.005, -- 每消一行加速
-    -- 重启机制
-    RESTART_DELAY = 0.3,  -- 消行后碎片重启延迟
-    RESTART_BLOCKS = 3,   -- 消行后重启到对面的方块数量
-    -- 颜色方案（霓虹风格）
-    COLORS = {
-        { 255, 80, 120, 255 },   -- 粉红
-        { 80, 200, 255, 255 },   -- 青蓝
-        { 255, 200, 60, 255 },   -- 金黄
-        { 120, 255, 120, 255 },  -- 翠绿
-        { 200, 120, 255, 255 },  -- 紫色
-        { 255, 140, 60, 255 },   -- 橘色
+    COLS = 10,
+    ROWS = 20,
+
+    -- 节奏
+    INITIAL_DROP_INTERVAL = 0.8,
+    MIN_DROP_INTERVAL = 0.08,
+    SPEED_ACCEL = 0.004,
+    LOCK_DELAY = 0.5,
+    RESTART_GRACE = 1.8,
+    SOFT_DROP_INTERVAL = 0.04,
+
+    -- DAS (键盘自动重复)
+    DAS_DELAY = 0.16,
+    DAS_REPEAT = 0.04,
+
+    -- 方块颜色（霓虹风格，索引对应方块类型 1-7）
+    PIECE_COLORS = {
+        { 0, 230, 230, 255 },     -- 1: I 青
+        { 230, 230, 0, 255 },     -- 2: O 黄
+        { 170, 0, 255, 255 },     -- 3: T 紫
+        { 0, 230, 100, 255 },     -- 4: S 绿
+        { 230, 50, 50, 255 },     -- 5: Z 红
+        { 50, 50, 230, 255 },     -- 6: J 蓝
+        { 230, 150, 0, 255 },     -- 7: L 橙
     },
-    BG_COLOR = { 12, 14, 24, 255 },
-    GRID_COLOR = { 40, 45, 65, 80 },
-    GRID_BORDER_COLOR = { 60, 70, 100, 180 },
+
+    BG_COLOR = { 10, 12, 22 },
+    GRID_LINE_RGBA = { 35, 40, 58, 45 },
+    GRID_BORDER_RGBA = { 70, 80, 120, 200 },
+    GHOST_ALPHA = 35,
 }
+
+-- ============================================================================
+-- 方块形状定义（基础矩阵，旋转在运行时计算）
+-- ============================================================================
+local BASE_SHAPES = {
+    -- 1: I
+    {
+        { 0, 0, 0, 0 },
+        { 1, 1, 1, 1 },
+        { 0, 0, 0, 0 },
+        { 0, 0, 0, 0 },
+    },
+    -- 2: O
+    {
+        { 1, 1 },
+        { 1, 1 },
+    },
+    -- 3: T
+    {
+        { 0, 1, 0 },
+        { 1, 1, 1 },
+        { 0, 0, 0 },
+    },
+    -- 4: S
+    {
+        { 0, 1, 1 },
+        { 1, 1, 0 },
+        { 0, 0, 0 },
+    },
+    -- 5: Z
+    {
+        { 1, 1, 0 },
+        { 0, 1, 1 },
+        { 0, 0, 0 },
+    },
+    -- 6: J
+    {
+        { 1, 0, 0 },
+        { 1, 1, 1 },
+        { 0, 0, 0 },
+    },
+    -- 7: L
+    {
+        { 0, 0, 1 },
+        { 1, 1, 1 },
+        { 0, 0, 0 },
+    },
+}
+
+--- 预计算旋转表 ROTATIONS[type][rotState] = matrix
+---@type table<number, table<number, number[][]>>
+local ROTATIONS = {}
+
+--- 矩阵顺时针旋转 90 度
+local function RotateMatrixCW(m)
+    local rows = #m
+    local cols = #m[1]
+    local result = {}
+    for c = 1, cols do
+        result[c] = {}
+        for r = rows, 1, -1 do
+            result[c][rows - r + 1] = m[r][c]
+        end
+    end
+    return result
+end
+
+local function InitRotations()
+    for i, shape in ipairs(BASE_SHAPES) do
+        ROTATIONS[i] = {}
+        local cur = shape
+        for rot = 1, 4 do
+            ROTATIONS[i][rot] = cur
+            cur = RotateMatrixCW(cur)
+        end
+    end
+end
 
 -- ============================================================================
 -- 游戏状态
 -- ============================================================================
-local gameState = "menu"   -- menu / playing / gameover
+local gameState = "menu" -- menu / playing / gameover
 
 ---@type number[][]
-local grid = {}            -- grid[row][col] = colorIndex or 0
+local grid = {} -- grid[row][col] = colorIndex (0=空)
 
-local currentBlock = nil   -- { col, row, colorIndex, gravityDown }
-local gravityDown = true   -- true=从上往下, false=从下往上
+-- 当前方块
+local current = nil -- { type, rot, row, col }
+local gravityDown = true
 
+-- 下落计时
 local dropTimer = 0
-local dropInterval = CONFIG.DROP_INTERVAL
+local dropInterval = CONFIG.INITIAL_DROP_INTERVAL
 
+-- 锁定延迟
+local lockTimer = 0
+local isLocking = false
+
+-- 重启机制
+local nextFromOpposite = false
+local isRestartPiece = false
+local restartGraceTimer = 0
+local restartDropDir = 0 -- 重启方块的固定下落方向 (-1 or 1)
+
+-- 软降
+local isSoftDrop = false
+
+-- 分数
 local score = 0
 local linesCleared = 0
+local level = 1
 local highScore = 0
 local combo = 0
 
--- 重启队列: 消行后等待重生的方块
-local restartQueue = {}    -- { { col, colorIndex, delay, timer } }
-
 -- 消行动画
-local clearAnimations = {} -- { { row, timer, maxTime } }
+local clearAnimations = {}
 
--- 屏幕布局（运行时计算）
+-- DAS (键盘长按自动重复)
+local dasDir = 0
+local dasTimer = 0
+local dasTriggered = false
+
+-- 屏幕布局
 local layout = {
+    screenW = 0, screenH = 0,
     gridX = 0, gridY = 0,
     gridW = 0, gridH = 0,
     cellSize = 0,
-    screenW = 0, screenH = 0,
 }
 
--- UI 引用
+-- UI
 local uiRoot_ = nil
 
 -- ============================================================================
@@ -78,6 +181,7 @@ local uiRoot_ = nil
 
 function Start()
     graphics.windowTitle = CONFIG.Title
+    InitRotations()
 
     UI.Init({
         fonts = {
@@ -91,9 +195,16 @@ function Start()
     CalculateLayout()
     InitGrid()
     CreateUI()
-    SubscribeToEvents()
+
+    SubscribeToEvent("Update", "HandleUpdate")
+    SubscribeToEvent("KeyDown", "HandleKeyDown")
+    SubscribeToEvent("KeyUp", "HandleKeyUp")
+    SubscribeToEvent("MouseButtonDown", "HandleMouseClick")
+    SubscribeToEvent("TouchBegin", "HandleTouchBegin")
+    SubscribeToEvent("NanoVGRender", "HandleNanoVGRender")
 
     print("=== RE:Flip Started ===")
+    print("Controls: Arrows=move/rotate, Space=flip, C=hard drop")
 end
 
 function Stop()
@@ -101,36 +212,36 @@ function Stop()
 end
 
 -- ============================================================================
--- 布局计算
+-- 布局
 -- ============================================================================
 
 function CalculateLayout()
     local dpr = graphics:GetDPR()
-    local physW = graphics:GetWidth()
-    local physH = graphics:GetHeight()
-    layout.screenW = physW / dpr
-    layout.screenH = physH / dpr
+    layout.screenW = graphics:GetWidth() / dpr
+    layout.screenH = graphics:GetHeight() / dpr
 
-    -- 根据屏幕高度计算 cell 大小，留出上下 HUD 空间
-    local availableH = layout.screenH * 0.75
-    local availableW = layout.screenW * 0.9
-    local cellByH = math.floor(availableH / CONFIG.ROWS)
-    local cellByW = math.floor(availableW / CONFIG.COLS)
-    layout.cellSize = math.min(cellByH, cellByW)
+    local btnAreaH = 96
+    local hudH = 52
+    local pad = 16
+    local availH = layout.screenH - btnAreaH - hudH - pad
+    local availW = layout.screenW * 0.92
 
-    CONFIG.CELL_SIZE = layout.cellSize
+    local cellByH = availH / CONFIG.ROWS
+    local cellByW = availW / CONFIG.COLS
+    layout.cellSize = math.floor(math.min(cellByH, cellByW))
+
     layout.gridW = layout.cellSize * CONFIG.COLS
     layout.gridH = layout.cellSize * CONFIG.ROWS
-    layout.gridX = (layout.screenW - layout.gridW) / 2
-    layout.gridY = (layout.screenH - layout.gridH) / 2 + 10
+    layout.gridX = math.floor((layout.screenW - layout.gridW) / 2)
+    layout.gridY = hudH + math.floor((availH - layout.gridH) / 2)
 
-    print(string.format("Layout: screen=%dx%d cell=%d grid=%dx%d at (%d,%d)",
+    print(string.format("[Layout] screen=%dx%d cell=%d grid=%dx%d at(%d,%d)",
         layout.screenW, layout.screenH, layout.cellSize,
         layout.gridW, layout.gridH, layout.gridX, layout.gridY))
 end
 
 -- ============================================================================
--- 网格初始化
+-- 网格
 -- ============================================================================
 
 function InitGrid()
@@ -144,261 +255,259 @@ function InitGrid()
 end
 
 -- ============================================================================
--- UI 创建
+-- 方块核心操作
 -- ============================================================================
 
-function CreateUI()
-    uiRoot_ = UI.Panel {
-        id = "gameRoot",
-        width = "100%",
-        height = "100%",
-        pointerEvents = "box-none",
-        children = {
-            -- 顶部 HUD
-            UI.Panel {
-                id = "topHud",
-                position = "absolute",
-                top = 8, left = 0, right = 0,
-                height = 50,
-                flexDirection = "row",
-                justifyContent = "space-between",
-                alignItems = "center",
-                paddingLeft = 16, paddingRight = 16,
-                pointerEvents = "none",
-                children = {
-                    UI.Label {
-                        id = "titleLabel",
-                        text = "RE:Flip",
-                        fontSize = 20,
-                        fontColor = { 200, 120, 255, 255 },
-                    },
-                    UI.Label {
-                        id = "scoreLabel",
-                        text = "0",
-                        fontSize = 22,
-                        fontColor = { 255, 255, 255, 255 },
-                    },
-                },
-            },
-
-            -- 重力方向指示器
-            UI.Label {
-                id = "gravityLabel",
-                text = "v",
-                fontSize = 28,
-                fontColor = { 255, 200, 60, 200 },
-                position = "absolute",
-                bottom = 16,
-                left = 0, right = 0,
-                textAlign = "center",
-            },
-        },
-    }
-
-    UI.SetRoot(uiRoot_)
+--- 获取当前方块的矩阵
+local function GetMatrix(pieceType, rot)
+    return ROTATIONS[pieceType][rot]
 end
 
--- ============================================================================
--- 事件订阅
--- ============================================================================
-
-function SubscribeToEvents()
-    SubscribeToEvent("Update", "HandleUpdate")
-    SubscribeToEvent("MouseButtonDown", "HandleClick")
-    SubscribeToEvent("TouchBegin", "HandleTouch")
-    SubscribeToEvent("KeyDown", "HandleKeyDown")
-    SubscribeToEvent("NanoVGRender", "HandleNanoVGRender")
+--- 检查方块能否放在指定位置
+local function CanPlace(pType, rot, row, col)
+    local m = GetMatrix(pType, rot)
+    for r = 1, #m do
+        for c = 1, #m[r] do
+            if m[r][c] == 1 then
+                local gr = row + r - 1
+                local gc = col + c - 1
+                if gr < 1 or gr > CONFIG.ROWS or gc < 1 or gc > CONFIG.COLS then
+                    return false
+                end
+                if grid[gr][gc] ~= 0 then
+                    return false
+                end
+            end
+        end
+    end
+    return true
 end
 
--- ============================================================================
--- 游戏逻辑
--- ============================================================================
+--- 获取方块的当前下落方向
+local function GetDropStep()
+    if isRestartPiece then
+        return restartDropDir
+    end
+    return gravityDown and 1 or -1
+end
 
-function SpawnBlock()
-    local col = math.random(1, CONFIG.COLS)
-    local colorIndex = math.random(1, #CONFIG.COLORS)
+--- 获取 ghost 行（方块直降的位置）
+local function GetGhostRow()
+    if not current then return nil end
+    local step = GetDropStep()
+    local testRow = current.row
+    while CanPlace(current.type, current.rot, testRow + step, current.col) do
+        testRow = testRow + step
+    end
+    return testRow
+end
+
+--- 生成新方块
+function SpawnPiece()
+    local pType = math.random(1, 7)
+    local rot = 1
+    local m = GetMatrix(pType, rot)
+    local mW = #m[1]
+
+    -- 水平居中
+    local col = math.floor((CONFIG.COLS - mW) / 2) + 1
     local row
-    if gravityDown then
-        row = 1
+
+    if nextFromOpposite then
+        -- 重启方块：从对面出现
+        if gravityDown then
+            row = CONFIG.ROWS - #m + 1 -- 底部
+            restartDropDir = -1         -- 向上移动
+        else
+            row = 1                     -- 顶部
+            restartDropDir = 1          -- 向下移动
+        end
+        isRestartPiece = true
+        restartGraceTimer = CONFIG.RESTART_GRACE
+        nextFromOpposite = false
     else
-        row = CONFIG.ROWS
+        -- 正常生成
+        if gravityDown then
+            row = 1
+        else
+            row = CONFIG.ROWS - #m + 1
+        end
+        isRestartPiece = false
+        restartGraceTimer = 0
     end
 
-    -- 检查生成位置是否已被占据
-    if grid[row][col] ~= 0 then
-        -- Game Over
+    if not CanPlace(pType, rot, row, col) then
         gameState = "gameover"
-        if score > highScore then
-            highScore = score
-        end
+        if score > highScore then highScore = score end
+        SetControlsVisible(false)
         print("Game Over! Score: " .. score)
         return
     end
 
-    currentBlock = {
-        col = col,
-        row = row,
-        colorIndex = colorIndex,
-        gravityDown = gravityDown,
-    }
+    current = { type = pType, rot = rot, row = row, col = col }
+    dropTimer = 0
+    isLocking = false
+    lockTimer = 0
 end
 
-function LandBlock()
-    if not currentBlock then return end
+--- 移动方块
+function MovePiece(dc)
+    if not current then return false end
+    if CanPlace(current.type, current.rot, current.row, current.col + dc) then
+        current.col = current.col + dc
+        if isLocking then lockTimer = 0 end
+        return true
+    end
+    return false
+end
 
-    local r = math.floor(currentBlock.row + 0.5)
-    r = math.max(1, math.min(CONFIG.ROWS, r))
+--- 旋转方块（顺时针）
+function RotatePiece()
+    if not current then return false end
+    local newRot = (current.rot % 4) + 1
 
-    if grid[r][currentBlock.col] ~= 0 then
-        -- 回退一格
-        if currentBlock.gravityDown then
-            r = r - 1
-        else
-            r = r + 1
+    -- 直接旋转
+    if CanPlace(current.type, newRot, current.row, current.col) then
+        current.rot = newRot
+        if isLocking then lockTimer = 0 end
+        return true
+    end
+
+    -- Wall kick 尝试
+    local kicks = { { 0, -1 }, { 0, 1 }, { -1, 0 }, { 1, 0 }, { 0, -2 }, { 0, 2 } }
+    for _, k in ipairs(kicks) do
+        if CanPlace(current.type, newRot, current.row + k[1], current.col + k[2]) then
+            current.rot = newRot
+            current.row = current.row + k[1]
+            current.col = current.col + k[2]
+            if isLocking then lockTimer = 0 end
+            return true
         end
     end
-
-    if r < 1 or r > CONFIG.ROWS then
-        gameState = "gameover"
-        if score > highScore then highScore = score end
-        currentBlock = nil
-        return
-    end
-
-    grid[r][currentBlock.col] = currentBlock.colorIndex
-    currentBlock = nil
-
-    -- 检查消行
-    CheckLines()
-
-    -- 生成下一个方块
-    SpawnBlock()
+    return false
 end
 
-function CheckLines()
-    local cleared = {}
+--- 锁定方块到网格
+function LockPiece()
+    if not current then return end
+    local m = GetMatrix(current.type, current.rot)
+    for r = 1, #m do
+        for c = 1, #m[r] do
+            if m[r][c] == 1 then
+                local gr = current.row + r - 1
+                local gc = current.col + c - 1
+                if gr >= 1 and gr <= CONFIG.ROWS and gc >= 1 and gc <= CONFIG.COLS then
+                    grid[gr][gc] = current.type
+                end
+            end
+        end
+    end
+    current = nil
+    isLocking = false
+    lockTimer = 0
+    isRestartPiece = false
+    restartGraceTimer = 0
 
+    CheckAndClearLines()
+end
+
+--- 硬降
+function HardDrop()
+    if not current then return end
+    local ghostRow = GetGhostRow()
+    if ghostRow then
+        local dist = math.abs(ghostRow - current.row)
+        score = score + dist * 2
+        current.row = ghostRow
+        LockPiece()
+        UpdateScoreDisplay()
+    end
+end
+
+--- 翻转重力
+function FlipGravity()
+    if not current then return end
+    gravityDown = not gravityDown
+    dropTimer = 0
+    isLocking = false
+    lockTimer = 0
+
+    -- 更新 UI 指示
+    local lbl = uiRoot_ and uiRoot_:FindById("gravityLabel")
+    if lbl then lbl:SetText(gravityDown and "GRAVITY ▼" or "GRAVITY ▲") end
+
+    print("Gravity: " .. (gravityDown and "DOWN" or "UP"))
+end
+
+-- ============================================================================
+-- 消行与重启
+-- ============================================================================
+
+function CheckAndClearLines()
+    local cleared = {}
     for r = 1, CONFIG.ROWS do
         local full = true
         for c = 1, CONFIG.COLS do
-            if grid[r][c] == 0 then
-                full = false
-                break
-            end
+            if grid[r][c] == 0 then full = false; break end
         end
-        if full then
-            table.insert(cleared, r)
-        end
+        if full then table.insert(cleared, r) end
     end
 
     if #cleared > 0 then
         combo = combo + 1
-        local points = #cleared * 100 * combo
-        score = score + points
+        local pts = ({ 100, 300, 500, 800 })[math.min(#cleared, 4)] or 800
+        score = score + pts * level * combo
         linesCleared = linesCleared + #cleared
+        level = math.floor(linesCleared / 10) + 1
 
         -- 加速
-        dropInterval = math.max(CONFIG.DROP_SPEED_MIN,
-            dropInterval - CONFIG.SPEED_UP_RATE * #cleared)
+        dropInterval = math.max(CONFIG.MIN_DROP_INTERVAL,
+            CONFIG.INITIAL_DROP_INTERVAL - CONFIG.SPEED_ACCEL * linesCleared)
 
-        -- 收集被消行的方块颜色，准备重启到对面
-        for _, r in ipairs(cleared) do
-            for c = 1, CONFIG.COLS do
-                local colorIdx = grid[r][c]
-                if colorIdx > 0 then
-                    -- 随机选几个重启到对面
-                    if math.random() < (CONFIG.RESTART_BLOCKS / CONFIG.COLS) then
-                        table.insert(restartQueue, {
-                            col = c,
-                            colorIndex = colorIdx,
-                            delay = CONFIG.RESTART_DELAY + math.random() * 0.5,
-                            timer = 0,
-                            -- 从对面来：如果此行在上半部就重启到下面，反之亦然
-                            fromTop = (r > CONFIG.ROWS / 2),
-                        })
-                    end
-                end
-            end
-            -- 添加消除动画
-            table.insert(clearAnimations, {
-                row = r,
-                timer = 0,
-                maxTime = 0.3,
-            })
-        end
-
-        -- 消除行（从下往上删以保持索引稳定）
+        -- 删除满行（降序删以保持索引）
         table.sort(cleared, function(a, b) return a > b end)
         for _, r in ipairs(cleared) do
             table.remove(grid, r)
         end
         -- 补空行
         for _ = 1, #cleared do
-            -- 判断空行加在哪一端
-            -- 上半消除 → 顶部补空行；下半消除 → 底部补空行
-            local emptyRow = {}
-            for c = 1, CONFIG.COLS do
-                emptyRow[c] = 0
-            end
-            -- 简化: 消掉的行从上半来就在顶部补，否则底部补
-            -- 由于 cleared 已排序(降序)，我们用第一个(最大行号)判断
-            if cleared[1] > CONFIG.ROWS / 2 then
-                table.insert(grid, emptyRow)  -- 底部补
+            local empty = {}
+            for c = 1, CONFIG.COLS do empty[c] = 0 end
+            if gravityDown then
+                table.insert(grid, 1, empty) -- 顶部补
             else
-                table.insert(grid, 1, emptyRow) -- 顶部补
+                table.insert(grid, empty)     -- 底部补
             end
         end
 
-        -- 更新分数显示
+        -- 触发重启：下一个方块从对面出现
+        nextFromOpposite = true
+
+        -- 消行动画
+        for _, r in ipairs(cleared) do
+            table.insert(clearAnimations, { row = r, timer = 0, maxTime = 0.25 })
+        end
+
         UpdateScoreDisplay()
-        print(string.format("Cleared %d lines! Combo: x%d Score: %d Speed: %.2f",
-            #cleared, combo, score, dropInterval))
+        print(string.format("Clear %d | Combo x%d | Score %d | Lv.%d",
+            #cleared, combo, score, level))
     else
         combo = 0
     end
+
+    SpawnPiece()
 end
 
-function UpdateRestartQueue(dt)
-    local i = 1
-    while i <= #restartQueue do
-        local item = restartQueue[i]
-        item.timer = item.timer + dt
-        if item.timer >= item.delay then
-            -- 重启方块到对面
-            local targetRow
-            if item.fromTop then
-                -- 重启到顶部
-                targetRow = 1
-            else
-                -- 重启到底部
-                targetRow = CONFIG.ROWS
-            end
+-- ============================================================================
+-- 主循环
+-- ============================================================================
 
-            -- 从目标端开始找空位
-            if item.fromTop then
-                for r = 1, CONFIG.ROWS do
-                    if grid[r][item.col] == 0 then
-                        grid[r][item.col] = item.colorIndex
-                        break
-                    end
-                end
-            else
-                for r = CONFIG.ROWS, 1, -1 do
-                    if grid[r][item.col] == 0 then
-                        grid[r][item.col] = item.colorIndex
-                        break
-                    end
-                end
-            end
+---@param eventType string
+---@param eventData UpdateEventData
+function HandleUpdate(eventType, eventData)
+    local dt = eventData["TimeStep"]:GetFloat()
 
-            table.remove(restartQueue, i)
-        else
-            i = i + 1
-        end
-    end
-end
-
-function UpdateClearAnimations(dt)
+    -- 消行动画（任何状态都更新）
     local i = 1
     while i <= #clearAnimations do
         clearAnimations[i].timer = clearAnimations[i].timer + dt
@@ -408,419 +517,623 @@ function UpdateClearAnimations(dt)
             i = i + 1
         end
     end
-end
 
-function FlipGravity()
-    gravityDown = not gravityDown
+    if gameState ~= "playing" or not current then return end
 
-    -- 翻转当前方块的方向
-    if currentBlock then
-        currentBlock.gravityDown = gravityDown
-    end
-
-    -- 更新重力指示器
-    local label = uiRoot_:FindById("gravityLabel")
-    if label then
-        if gravityDown then
-            label:SetText("v")
+    -- DAS（键盘长按自动重复移动）
+    if dasDir ~= 0 then
+        dasTimer = dasTimer + dt
+        if dasTriggered then
+            if dasTimer >= CONFIG.DAS_REPEAT then
+                dasTimer = 0
+                MovePiece(dasDir)
+            end
         else
-            label:SetText("^")
-        end
-    end
-end
-
-function ResetGame()
-    InitGrid()
-    score = 0
-    linesCleared = 0
-    combo = 0
-    dropTimer = 0
-    dropInterval = CONFIG.DROP_INTERVAL
-    gravityDown = true
-    currentBlock = nil
-    restartQueue = {}
-    clearAnimations = {}
-    gameState = "playing"
-    UpdateScoreDisplay()
-    SpawnBlock()
-
-    local label = uiRoot_:FindById("gravityLabel")
-    if label then label:SetText("v") end
-end
-
-function UpdateScoreDisplay()
-    local label = uiRoot_:FindById("scoreLabel")
-    if label then
-        label:SetText(tostring(score))
-    end
-end
-
--- ============================================================================
--- 事件处理
--- ============================================================================
-
----@param eventType string
----@param eventData UpdateEventData
-function HandleUpdate(eventType, eventData)
-    local dt = eventData["TimeStep"]:GetFloat()
-
-    if gameState == "playing" then
-        -- 更新方块下落
-        dropTimer = dropTimer + dt
-        if dropTimer >= dropInterval then
-            dropTimer = 0
-            if currentBlock then
-                -- 移动方块
-                if currentBlock.gravityDown then
-                    currentBlock.row = currentBlock.row + 1
-                else
-                    currentBlock.row = currentBlock.row - 1
-                end
-
-                -- 碰撞检测
-                local nextRow = math.floor(currentBlock.row + 0.5)
-                if currentBlock.gravityDown then
-                    if nextRow > CONFIG.ROWS then
-                        currentBlock.row = CONFIG.ROWS
-                        LandBlock()
-                    elseif grid[nextRow][currentBlock.col] ~= 0 then
-                        currentBlock.row = nextRow - 1
-                        LandBlock()
-                    end
-                else
-                    if nextRow < 1 then
-                        currentBlock.row = 1
-                        LandBlock()
-                    elseif grid[nextRow][currentBlock.col] ~= 0 then
-                        currentBlock.row = nextRow + 1
-                        LandBlock()
-                    end
-                end
+            if dasTimer >= CONFIG.DAS_DELAY then
+                dasTriggered = true
+                dasTimer = 0
+                MovePiece(dasDir)
             end
         end
+    end
 
-        -- 更新重启队列
-        UpdateRestartQueue(dt)
+    -- 软降
+    isSoftDrop = input:GetKeyDown(KEY_DOWN)
 
-        -- 更新消除动画
-        UpdateClearAnimations(dt)
+    -- 重启方块调整期
+    if isRestartPiece and restartGraceTimer > 0 then
+        restartGraceTimer = restartGraceTimer - dt
+        if restartGraceTimer <= 0 then
+            HardDrop()
+        end
+        return -- 调整期间不自动下落
+    end
+
+    -- 下落逻辑
+    local step = GetDropStep()
+    local curInterval = isSoftDrop and CONFIG.SOFT_DROP_INTERVAL or dropInterval
+
+    if isLocking then
+        lockTimer = lockTimer + dt
+        if lockTimer >= CONFIG.LOCK_DELAY then
+            LockPiece()
+            UpdateScoreDisplay()
+        end
+    else
+        dropTimer = dropTimer + dt
+        if dropTimer >= curInterval then
+            dropTimer = 0
+            local nextRow = current.row + step
+            if CanPlace(current.type, current.rot, nextRow, current.col) then
+                current.row = nextRow
+                if isSoftDrop then score = score + 1 end
+            else
+                isLocking = true
+                lockTimer = 0
+            end
+        end
     end
 end
 
----@param eventType string
----@param eventData MouseButtonDownEventData
-function HandleClick(eventType, eventData)
-    local button = eventData["Button"]:GetInt()
-    if button ~= MOUSEB_LEFT then return end
-
-    if gameState == "menu" then
-        ResetGame()
-    elseif gameState == "playing" then
-        FlipGravity()
-    elseif gameState == "gameover" then
-        ResetGame()
-    end
-end
-
----@param eventType string
----@param eventData TouchBeginEventData
-function HandleTouch(eventType, eventData)
-    if gameState == "menu" then
-        ResetGame()
-    elseif gameState == "playing" then
-        FlipGravity()
-    elseif gameState == "gameover" then
-        ResetGame()
-    end
-end
+-- ============================================================================
+-- 输入处理
+-- ============================================================================
 
 ---@param eventType string
 ---@param eventData KeyDownEventData
 function HandleKeyDown(eventType, eventData)
     local key = eventData["Key"]:GetInt()
 
-    if key == KEY_SPACE then
-        if gameState == "menu" then
-            ResetGame()
-        elseif gameState == "playing" then
-            FlipGravity()
-        elseif gameState == "gameover" then
-            ResetGame()
-        end
-    elseif key == KEY_ESCAPE then
-        if gameState == "playing" then
-            gameState = "menu"
-        end
+    if gameState == "menu" or gameState == "gameover" then
+        if key == KEY_SPACE or key == KEY_RETURN then StartGame() end
+        return
+    end
+
+    -- Playing
+    if key == KEY_LEFT then
+        MovePiece(-1)
+        dasDir = -1; dasTimer = 0; dasTriggered = false
+    elseif key == KEY_RIGHT then
+        MovePiece(1)
+        dasDir = 1; dasTimer = 0; dasTriggered = false
+    elseif key == KEY_UP or key == KEY_X then
+        RotatePiece()
+    elseif key == KEY_SPACE or key == KEY_Z then
+        FlipGravity()
+    elseif key == KEY_C then
+        HardDrop()
+        UpdateScoreDisplay()
     end
 end
 
+---@param eventType string
+---@param eventData KeyUpEventData
+function HandleKeyUp(eventType, eventData)
+    local key = eventData["Key"]:GetInt()
+    if key == KEY_LEFT and dasDir == -1 then dasDir = 0 end
+    if key == KEY_RIGHT and dasDir == 1 then dasDir = 0 end
+end
+
+--- 屏幕点击（菜单/结算画面切换）
+function HandleScreenTap()
+    if gameState == "menu" or gameState == "gameover" then
+        StartGame()
+    end
+end
+
+---@param eventType string
+---@param eventData MouseButtonDownEventData
+function HandleMouseClick(eventType, eventData)
+    if eventData["Button"]:GetInt() == MOUSEB_LEFT then HandleScreenTap() end
+end
+
+---@param eventType string
+---@param eventData TouchBeginEventData
+function HandleTouchBegin(eventType, eventData)
+    HandleScreenTap()
+end
+
 -- ============================================================================
--- NanoVG 渲染（游戏画面）
+-- 游戏流程
+-- ============================================================================
+
+function StartGame()
+    InitGrid()
+    score = 0
+    linesCleared = 0
+    level = 1
+    combo = 0
+    dropTimer = 0
+    dropInterval = CONFIG.INITIAL_DROP_INTERVAL
+    gravityDown = true
+    current = nil
+    nextFromOpposite = false
+    isRestartPiece = false
+    restartGraceTimer = 0
+    isLocking = false
+    lockTimer = 0
+    dasDir = 0; dasTimer = 0; dasTriggered = false
+    isSoftDrop = false
+    clearAnimations = {}
+
+    gameState = "playing"
+    SetControlsVisible(true)
+    SpawnPiece()
+    UpdateScoreDisplay()
+
+    local lbl = uiRoot_ and uiRoot_:FindById("gravityLabel")
+    if lbl then lbl:SetText("GRAVITY ▼") end
+
+    print("=== New Game! ===")
+end
+
+function UpdateScoreDisplay()
+    local s = uiRoot_ and uiRoot_:FindById("scoreLabel")
+    if s then s:SetText(tostring(score)) end
+    local l = uiRoot_ and uiRoot_:FindById("levelLabel")
+    if l then l:SetText("Lv." .. level) end
+end
+
+function SetControlsVisible(visible)
+    local ctrl = uiRoot_ and uiRoot_:FindById("controls")
+    if ctrl then ctrl:SetVisible(visible) end
+end
+
+-- ============================================================================
+-- UI
+-- ============================================================================
+
+function CreateUI()
+    uiRoot_ = UI.Panel {
+        id = "root",
+        width = "100%", height = "100%",
+        pointerEvents = "box-none",
+        children = {
+            -- HUD 顶栏
+            UI.Panel {
+                id = "hud",
+                position = "absolute",
+                top = 0, left = 0, right = 0, height = 44,
+                flexDirection = "row",
+                justifyContent = "space-between",
+                alignItems = "center",
+                paddingLeft = 16, paddingRight = 16,
+                pointerEvents = "none",
+                children = {
+                    UI.Label {
+                        id = "titleLabel",
+                        text = "RE:Flip",
+                        fontSize = 18,
+                        fontColor = { 180, 100, 255, 255 },
+                    },
+                    UI.Panel {
+                        flexDirection = "row", gap = 12,
+                        children = {
+                            UI.Label {
+                                id = "levelLabel",
+                                text = "Lv.1",
+                                fontSize = 13,
+                                fontColor = { 255, 200, 60, 220 },
+                            },
+                            UI.Label {
+                                id = "scoreLabel",
+                                text = "0",
+                                fontSize = 20,
+                                fontColor = { 255, 255, 255, 255 },
+                            },
+                        },
+                    },
+                },
+            },
+
+            -- 重力方向提示
+            UI.Label {
+                id = "gravityLabel",
+                text = "GRAVITY ▼",
+                fontSize = 11,
+                fontColor = { 255, 200, 60, 160 },
+                position = "absolute",
+                top = 40, left = 0, right = 0,
+                textAlign = "center",
+                pointerEvents = "none",
+            },
+
+            -- 虚拟按键
+            CreateControlButtons(),
+        },
+    }
+
+    UI.SetRoot(uiRoot_)
+    -- 初始隐藏控件（菜单状态）
+    SetControlsVisible(false)
+end
+
+function CreateControlButtons()
+    local sz = 54
+    local fs = 20
+    local bg = { 35, 40, 65, 220 }
+    local fg = { 210, 215, 240, 255 }
+
+    return UI.Panel {
+        id = "controls",
+        position = "absolute",
+        bottom = 0, left = 0, right = 0,
+        height = 88,
+        flexDirection = "row",
+        justifyContent = "space-evenly",
+        alignItems = "center",
+        paddingBottom = 16,
+        children = {
+            -- 左移
+            UI.Button {
+                text = "◀", width = sz, height = sz,
+                fontSize = fs,
+                backgroundColor = bg, fontColor = fg, borderRadius = 12,
+                onClick = function()
+                    if gameState == "playing" then MovePiece(-1) end
+                end,
+            },
+            -- 右移
+            UI.Button {
+                text = "▶", width = sz, height = sz,
+                fontSize = fs,
+                backgroundColor = bg, fontColor = fg, borderRadius = 12,
+                onClick = function()
+                    if gameState == "playing" then MovePiece(1) end
+                end,
+            },
+            -- 旋转
+            UI.Button {
+                text = "↻", width = sz, height = sz,
+                fontSize = fs + 4,
+                backgroundColor = bg, fontColor = fg, borderRadius = 12,
+                onClick = function()
+                    if gameState == "playing" then RotatePiece() end
+                end,
+            },
+            -- 翻转重力
+            UI.Button {
+                text = "⟳", width = sz + 8, height = sz,
+                fontSize = fs + 4,
+                backgroundColor = { 70, 35, 110, 220 },
+                fontColor = { 255, 200, 60, 255 },
+                borderRadius = 12,
+                onClick = function()
+                    if gameState == "playing" then FlipGravity() end
+                end,
+            },
+            -- 硬降
+            UI.Button {
+                text = "⤓", width = sz, height = sz,
+                fontSize = fs,
+                backgroundColor = { 60, 25, 25, 220 },
+                fontColor = { 255, 110, 110, 255 },
+                borderRadius = 12,
+                onClick = function()
+                    if gameState == "playing" then
+                        HardDrop()
+                        UpdateScoreDisplay()
+                    end
+                end,
+            },
+        },
+    }
+end
+
+-- ============================================================================
+-- NanoVG 渲染
 -- ============================================================================
 
 function HandleNanoVGRender(eventType, eventData)
     local vg = UI.GetNanoVGContext()
     if not vg then return end
 
-    local dpr = graphics:GetDPR()
-    local physW = graphics:GetWidth()
-    local physH = graphics:GetHeight()
-    local w = physW / dpr
-    local h = physH / dpr
-
-    -- 绘制游戏棋盘（在 UI 下层）
     nvgSave(vg)
 
     if gameState == "playing" or gameState == "gameover" then
         DrawGrid(vg)
-        DrawBlocks(vg)
-        DrawCurrentBlock(vg)
-        DrawClearAnimations(vg)
-        DrawGravityIndicator(vg, w, h)
+        DrawPlacedBlocks(vg)
+        if current then
+            DrawGhostPiece(vg)
+            DrawCurrentPiece(vg)
+        end
+        DrawClearEffects(vg)
+        DrawGravityArrow(vg)
     end
 
     if gameState == "menu" then
-        DrawMenuScreen(vg, w, h)
+        DrawMenuScreen(vg)
     elseif gameState == "gameover" then
-        DrawGameOverScreen(vg, w, h)
+        DrawGameOverScreen(vg)
     end
 
     nvgRestore(vg)
 end
 
+-- ------ 棋盘 ------
+
 function DrawGrid(vg)
     local x, y = layout.gridX, layout.gridY
     local w, h = layout.gridW, layout.gridH
     local cs = layout.cellSize
+    local gl = CONFIG.GRID_LINE_RGBA
+    local gb = CONFIG.GRID_BORDER_RGBA
 
-    -- 棋盘背景
+    -- 背景
     nvgBeginPath(vg)
-    nvgRoundedRect(vg, x - 2, y - 2, w + 4, h + 4, 4)
-    nvgFillColor(vg, nvgRGBA(20, 22, 35, 240))
+    nvgRoundedRect(vg, x - 1, y - 1, w + 2, h + 2, 4)
+    nvgFillColor(vg, nvgRGBA(16, 18, 30, 245))
     nvgFill(vg)
 
     -- 网格线
     nvgStrokeWidth(vg, 0.5)
-    nvgStrokeColor(vg, nvgRGBA(table.unpack(CONFIG.GRID_COLOR)))
-
-    for r = 0, CONFIG.ROWS do
+    nvgStrokeColor(vg, nvgRGBA(gl[1], gl[2], gl[3], gl[4]))
+    for r = 1, CONFIG.ROWS - 1 do
         nvgBeginPath(vg)
         nvgMoveTo(vg, x, y + r * cs)
         nvgLineTo(vg, x + w, y + r * cs)
         nvgStroke(vg)
     end
-    for c = 0, CONFIG.COLS do
+    for c = 1, CONFIG.COLS - 1 do
         nvgBeginPath(vg)
         nvgMoveTo(vg, x + c * cs, y)
         nvgLineTo(vg, x + c * cs, y + h)
         nvgStroke(vg)
     end
 
-    -- 中线（两摞的分界线）
-    nvgBeginPath(vg)
-    nvgMoveTo(vg, x, y + h / 2)
-    nvgLineTo(vg, x + w, y + h / 2)
-    nvgStrokeWidth(vg, 1.5)
-    nvgStrokeColor(vg, nvgRGBA(255, 200, 60, 60))
-    nvgStroke(vg)
-
     -- 边框
     nvgBeginPath(vg)
-    nvgRoundedRect(vg, x - 2, y - 2, w + 4, h + 4, 4)
+    nvgRoundedRect(vg, x - 1, y - 1, w + 2, h + 2, 4)
     nvgStrokeWidth(vg, 1.5)
-    nvgStrokeColor(vg, nvgRGBA(table.unpack(CONFIG.GRID_BORDER_COLOR)))
+    nvgStrokeColor(vg, nvgRGBA(gb[1], gb[2], gb[3], gb[4]))
     nvgStroke(vg)
 end
 
-function DrawBlocks(vg)
-    local cs = layout.cellSize
-    local padding = 1.5
+-- ------ 已放置方块 ------
 
+function DrawPlacedBlocks(vg)
+    local cs = layout.cellSize
+    local pad = 1
     for r = 1, CONFIG.ROWS do
         for c = 1, CONFIG.COLS do
-            local colorIdx = grid[r][c]
-            if colorIdx > 0 then
-                local color = CONFIG.COLORS[colorIdx]
-                local bx = layout.gridX + (c - 1) * cs + padding
-                local by = layout.gridY + (r - 1) * cs + padding
-                local bs = cs - padding * 2
-
-                -- 方块主体
-                nvgBeginPath(vg)
-                nvgRoundedRect(vg, bx, by, bs, bs, 3)
-                nvgFillColor(vg, nvgRGBA(color[1], color[2], color[3], color[4]))
-                nvgFill(vg)
-
-                -- 高光（左上）
-                nvgBeginPath(vg)
-                nvgRoundedRect(vg, bx, by, bs, bs / 2, 3)
-                nvgFillColor(vg, nvgRGBA(255, 255, 255, 35))
-                nvgFill(vg)
+            local ci = grid[r][c]
+            if ci > 0 then
+                DrawSingleCell(vg, r, c, CONFIG.PIECE_COLORS[ci], 255, false)
             end
         end
     end
 end
 
-function DrawCurrentBlock(vg)
-    if not currentBlock then return end
+-- ------ 当前方块 ------
 
+function DrawCurrentPiece(vg)
+    if not current then return end
+    local m = GetMatrix(current.type, current.rot)
+    local color = CONFIG.PIECE_COLORS[current.type]
+
+    for r = 1, #m do
+        for c = 1, #m[r] do
+            if m[r][c] == 1 then
+                local gr = current.row + r - 1
+                local gc = current.col + c - 1
+                DrawSingleCell(vg, gr, gc, color, 255, true)
+            end
+        end
+    end
+
+    -- 重启方块调整期提示
+    if isRestartPiece and restartGraceTimer > 0 then
+        nvgFontFace(vg, "sans")
+        nvgFontSize(vg, 12)
+        nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_BOTTOM)
+        nvgFillColor(vg, nvgRGBA(255, 200, 60, 220))
+        local cx = layout.gridX + layout.gridW / 2
+        local cy = layout.gridY - 6
+        nvgText(vg, cx, cy, string.format("RESTART! %.1fs", restartGraceTimer), nil)
+    end
+end
+
+-- ------ Ghost 方块 ------
+
+function DrawGhostPiece(vg)
+    if not current then return end
+    local ghostRow = GetGhostRow()
+    if not ghostRow or ghostRow == current.row then return end
+
+    local m = GetMatrix(current.type, current.rot)
+    local color = CONFIG.PIECE_COLORS[current.type]
     local cs = layout.cellSize
-    local padding = 1.5
-    local color = CONFIG.COLORS[currentBlock.colorIndex]
-    local bx = layout.gridX + (currentBlock.col - 1) * cs + padding
-    local by = layout.gridY + (currentBlock.row - 1) * cs + padding
-    local bs = cs - padding * 2
+    local pad = 1
 
-    -- 发光效果
-    nvgBeginPath(vg)
-    nvgRoundedRect(vg, bx - 3, by - 3, bs + 6, bs + 6, 5)
-    nvgFillColor(vg, nvgRGBA(color[1], color[2], color[3], 60))
-    nvgFill(vg)
+    for r = 1, #m do
+        for c = 1, #m[r] do
+            if m[r][c] == 1 then
+                local gr = ghostRow + r - 1
+                local gc = current.col + c - 1
+                local bx = layout.gridX + (gc - 1) * cs + pad
+                local by = layout.gridY + (gr - 1) * cs + pad
+                local bs = cs - pad * 2
 
-    -- 方块主体
+                nvgBeginPath(vg)
+                nvgRoundedRect(vg, bx, by, bs, bs, 2)
+                nvgStrokeWidth(vg, 1)
+                nvgStrokeColor(vg, nvgRGBA(color[1], color[2], color[3], CONFIG.GHOST_ALPHA))
+                nvgStroke(vg)
+            end
+        end
+    end
+end
+
+-- ------ 辅助：绘制一个格子 ------
+
+function DrawSingleCell(vg, gr, gc, color, alpha, glow)
+    local cs = layout.cellSize
+    local pad = 1
+    local bx = layout.gridX + (gc - 1) * cs + pad
+    local by = layout.gridY + (gr - 1) * cs + pad
+    local bs = cs - pad * 2
+
+    if glow then
+        nvgBeginPath(vg)
+        nvgRoundedRect(vg, bx - 2, by - 2, bs + 4, bs + 4, 4)
+        nvgFillColor(vg, nvgRGBA(color[1], color[2], color[3], 45))
+        nvgFill(vg)
+    end
+
     nvgBeginPath(vg)
-    nvgRoundedRect(vg, bx, by, bs, bs, 3)
-    nvgFillColor(vg, nvgRGBA(color[1], color[2], color[3], 255))
+    nvgRoundedRect(vg, bx, by, bs, bs, 2)
+    nvgFillColor(vg, nvgRGBA(color[1], color[2], color[3], alpha))
     nvgFill(vg)
 
     -- 高光
     nvgBeginPath(vg)
-    nvgRoundedRect(vg, bx + 1, by + 1, bs - 2, bs / 2 - 1, 2)
-    nvgFillColor(vg, nvgRGBA(255, 255, 255, 80))
+    nvgRoundedRect(vg, bx + 1, by + 1, bs - 2, bs * 0.35, 2)
+    nvgFillColor(vg, nvgRGBA(255, 255, 255, 30))
     nvgFill(vg)
 end
 
-function DrawClearAnimations(vg)
+-- ------ 消行特效 ------
+
+function DrawClearEffects(vg)
     local cs = layout.cellSize
-
-    for _, anim in ipairs(clearAnimations) do
-        local progress = anim.timer / anim.maxTime
-        local alpha = math.floor(255 * (1 - progress))
-        local expand = progress * 10
-
+    for _, a in ipairs(clearAnimations) do
+        local p = a.timer / a.maxTime
+        local alpha = math.floor(180 * (1 - p))
         nvgBeginPath(vg)
-        nvgRect(vg,
-            layout.gridX - expand,
-            layout.gridY + (anim.row - 1) * cs - expand / 2,
-            layout.gridW + expand * 2,
-            cs + expand)
+        nvgRect(vg, layout.gridX, layout.gridY + (a.row - 1) * cs,
+            layout.gridW, cs)
         nvgFillColor(vg, nvgRGBA(255, 255, 255, alpha))
         nvgFill(vg)
     end
 end
 
-function DrawGravityIndicator(vg, w, h)
-    -- 在棋盘两侧画箭头指示重力方向
-    local cx = layout.gridX + layout.gridW + 20
+-- ------ 重力方向箭头 ------
+
+function DrawGravityArrow(vg)
+    local cx = layout.gridX + layout.gridW + 14
     local cy = layout.gridY + layout.gridH / 2
-    local arrowLen = 30
+    local len = 18
 
     nvgStrokeWidth(vg, 2)
-    nvgStrokeColor(vg, nvgRGBA(255, 200, 60, 180))
-
+    nvgStrokeColor(vg, nvgRGBA(255, 200, 60, 130))
     nvgBeginPath(vg)
     if gravityDown then
-        nvgMoveTo(vg, cx, cy - arrowLen)
-        nvgLineTo(vg, cx, cy + arrowLen)
-        -- 箭头
-        nvgMoveTo(vg, cx - 6, cy + arrowLen - 10)
-        nvgLineTo(vg, cx, cy + arrowLen)
-        nvgLineTo(vg, cx + 6, cy + arrowLen - 10)
+        nvgMoveTo(vg, cx, cy - len)
+        nvgLineTo(vg, cx, cy + len)
+        nvgMoveTo(vg, cx - 5, cy + len - 7)
+        nvgLineTo(vg, cx, cy + len)
+        nvgLineTo(vg, cx + 5, cy + len - 7)
     else
-        nvgMoveTo(vg, cx, cy + arrowLen)
-        nvgLineTo(vg, cx, cy - arrowLen)
-        -- 箭头
-        nvgMoveTo(vg, cx - 6, cy - arrowLen + 10)
-        nvgLineTo(vg, cx, cy - arrowLen)
-        nvgLineTo(vg, cx + 6, cy - arrowLen + 10)
+        nvgMoveTo(vg, cx, cy + len)
+        nvgLineTo(vg, cx, cy - len)
+        nvgMoveTo(vg, cx - 5, cy - len + 7)
+        nvgLineTo(vg, cx, cy - len)
+        nvgLineTo(vg, cx + 5, cy - len + 7)
     end
     nvgStroke(vg)
 end
 
-function DrawMenuScreen(vg, w, h)
-    -- 半透明遮罩
+-- ============================================================================
+-- 菜单 / 结算画面
+-- ============================================================================
+
+function DrawMenuScreen(vg)
+    local w, h = layout.screenW, layout.screenH
+
+    -- 遮罩
     nvgBeginPath(vg)
     nvgRect(vg, 0, 0, w, h)
-    nvgFillColor(vg, nvgRGBA(12, 14, 24, 220))
+    nvgFillColor(vg, nvgRGBA(10, 12, 22, 235))
     nvgFill(vg)
 
-    -- 标题
     nvgFontFace(vg, "sans")
     nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
 
-    -- "RE:Flip" 大标题
-    nvgFontSize(vg, 52)
-    nvgFillColor(vg, nvgRGBA(200, 120, 255, 255))
-    nvgText(vg, w / 2, h * 0.3, "RE:Flip", nil)
+    -- 标题
+    nvgFontSize(vg, 46)
+    nvgFillColor(vg, nvgRGBA(180, 100, 255, 255))
+    nvgText(vg, w / 2, h * 0.22, "RE:Flip", nil)
 
-    -- 副标题
-    nvgFontSize(vg, 16)
+    nvgFontSize(vg, 13)
     nvgFillColor(vg, nvgRGBA(255, 200, 60, 200))
-    nvgText(vg, w / 2, h * 0.3 + 40, "RESTART FROM THE OTHER SIDE", nil)
+    nvgText(vg, w / 2, h * 0.22 + 34, "RESTART FROM THE OTHER SIDE", nil)
 
-    -- 玩法说明
-    nvgFontSize(vg, 14)
+    -- 说明
+    nvgFontSize(vg, 13)
     nvgFillColor(vg, nvgRGBA(180, 190, 220, 200))
-    nvgText(vg, w / 2, h * 0.52, "方块自动下落", nil)
-    nvgText(vg, w / 2, h * 0.52 + 24, "点击屏幕 = 翻转重力", nil)
-    nvgText(vg, w / 2, h * 0.52 + 48, "填满一行 = 消除", nil)
-    nvgText(vg, w / 2, h * 0.52 + 72, "消除的方块会重启到对面", nil)
+    local lines = {
+        "经典俄罗斯方块 + 重力翻转",
+        "",
+        "◀ ▶  移动       ↻  旋转",
+        "⟳  翻转重力     ⤓  硬降",
+        "",
+        "消除整行 → 新方块从对面重启！",
+        "管理好上下两端，坚持到底！",
+    }
+    for i, line in ipairs(lines) do
+        nvgText(vg, w / 2, h * 0.42 + (i - 1) * 22, line, nil)
+    end
 
-    -- 开始提示
-    local time = GetTime():GetElapsedTime()
-    local alpha = math.floor(150 + 105 * math.sin(time * 3))
-    nvgFontSize(vg, 20)
+    -- PC 按键提示
+    nvgFontSize(vg, 11)
+    nvgFillColor(vg, nvgRGBA(120, 130, 160, 150))
+    nvgText(vg, w / 2, h * 0.72, "PC: ← → 移动 | ↑ 旋转 | Space 翻转 | C 硬降", nil)
+
+    -- 闪烁提示
+    local t = GetTime():GetElapsedTime()
+    local alpha = math.floor(130 + 125 * math.sin(t * 3))
+    nvgFontSize(vg, 18)
     nvgFillColor(vg, nvgRGBA(255, 255, 255, alpha))
-    nvgText(vg, w / 2, h * 0.78, "点击开始", nil)
+    nvgText(vg, w / 2, h * 0.82, "点击开始游戏", nil)
 
-    -- 最高分
     if highScore > 0 then
-        nvgFontSize(vg, 14)
-        nvgFillColor(vg, nvgRGBA(255, 200, 60, 160))
-        nvgText(vg, w / 2, h * 0.85, "Best: " .. highScore, nil)
+        nvgFontSize(vg, 13)
+        nvgFillColor(vg, nvgRGBA(255, 200, 60, 140))
+        nvgText(vg, w / 2, h * 0.88, "Best: " .. highScore, nil)
     end
 end
 
-function DrawGameOverScreen(vg, w, h)
-    -- 半透明遮罩
+function DrawGameOverScreen(vg)
+    local w, h = layout.screenW, layout.screenH
+
     nvgBeginPath(vg)
     nvgRect(vg, 0, 0, w, h)
-    nvgFillColor(vg, nvgRGBA(12, 14, 24, 180))
+    nvgFillColor(vg, nvgRGBA(10, 12, 22, 190))
     nvgFill(vg)
 
     nvgFontFace(vg, "sans")
     nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
 
-    -- Game Over
-    nvgFontSize(vg, 40)
-    nvgFillColor(vg, nvgRGBA(255, 80, 120, 255))
-    nvgText(vg, w / 2, h * 0.3, "GAME OVER", nil)
+    nvgFontSize(vg, 36)
+    nvgFillColor(vg, nvgRGBA(255, 50, 90, 255))
+    nvgText(vg, w / 2, h * 0.25, "GAME OVER", nil)
 
-    -- 分数
-    nvgFontSize(vg, 28)
+    nvgFontSize(vg, 24)
     nvgFillColor(vg, nvgRGBA(255, 255, 255, 255))
-    nvgText(vg, w / 2, h * 0.42, "Score: " .. score, nil)
+    nvgText(vg, w / 2, h * 0.37, tostring(score), nil)
 
-    -- 消行数
-    nvgFontSize(vg, 16)
+    nvgFontSize(vg, 13)
     nvgFillColor(vg, nvgRGBA(180, 190, 220, 200))
-    nvgText(vg, w / 2, h * 0.50, "Lines: " .. linesCleared, nil)
+    nvgText(vg, w / 2, h * 0.37 + 28, "SCORE", nil)
 
-    -- 最高分
-    if score >= highScore then
-        nvgFontSize(vg, 18)
-        nvgFillColor(vg, nvgRGBA(255, 200, 60, 255))
-        nvgText(vg, w / 2, h * 0.58, "NEW BEST!", nil)
-    else
+    nvgFontSize(vg, 14)
+    nvgFillColor(vg, nvgRGBA(180, 190, 220, 180))
+    nvgText(vg, w / 2, h * 0.50,
+        "Lines " .. linesCleared .. "  |  Level " .. level, nil)
+
+    if score >= highScore and score > 0 then
         nvgFontSize(vg, 16)
-        nvgFillColor(vg, nvgRGBA(255, 200, 60, 160))
-        nvgText(vg, w / 2, h * 0.58, "Best: " .. highScore, nil)
+        nvgFillColor(vg, nvgRGBA(255, 200, 60, 255))
+        nvgText(vg, w / 2, h * 0.57, "NEW BEST!", nil)
+    elseif highScore > 0 then
+        nvgFontSize(vg, 13)
+        nvgFillColor(vg, nvgRGBA(255, 200, 60, 150))
+        nvgText(vg, w / 2, h * 0.57, "Best: " .. highScore, nil)
     end
 
-    -- 重新开始
-    local time = GetTime():GetElapsedTime()
-    local alpha = math.floor(150 + 105 * math.sin(time * 3))
-    nvgFontSize(vg, 18)
+    local t = GetTime():GetElapsedTime()
+    local alpha = math.floor(130 + 125 * math.sin(t * 3))
+    nvgFontSize(vg, 16)
     nvgFillColor(vg, nvgRGBA(255, 255, 255, alpha))
     nvgText(vg, w / 2, h * 0.72, "点击重新开始", nil)
 end
