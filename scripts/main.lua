@@ -217,8 +217,8 @@ end
 
 function CalculateLayout()
     local dpr = graphics:GetDPR()
-    layout.screenW = graphics:GetWidth() / dpr
-    layout.screenH = graphics:GetHeight() / dpr
+    layout.screenW = math.floor(graphics:GetWidth() / dpr)
+    layout.screenH = math.floor(graphics:GetHeight() / dpr)
 
     local btnAreaH = 96
     local hudH = 52
