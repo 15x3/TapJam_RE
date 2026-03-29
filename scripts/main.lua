@@ -6,6 +6,59 @@
 
 local UI = require("urhox-libs/UI")
 local ImageCache = require("urhox-libs/UI/Core/ImageCache")
+local Filters = require("filters")
+local Anim = require("anim")
+
+-- 日志
+local LOG = true
+local function log(...)
+    if LOG then print("[RE:Flip]", ...) end
+end
+
+-- ============================================================================
+-- 持久化存档（累计分数 & 滤镜解锁）
+-- ============================================================================
+---@diagnostic disable-next-line: undefined-global
+local cjson = cjson
+local UNLOCK_COST = 500        -- 每解锁一个滤镜需要的累计分数
+local totalScore_ = 0          -- 历史累计总分
+
+local function loadProgress()
+    if not fileSystem:FileExists("progress.json") then return end
+    local file = File("progress.json", FILE_READ)
+    if not file:IsOpen() then return end
+    local ok, data = pcall(cjson.decode, file:ReadString())
+    file:Close()
+    if ok and data then
+        totalScore_ = data.totalScore or 0
+        local unlocked = math.floor(totalScore_ / UNLOCK_COST) + 1  -- +1 for Original
+        Filters.setUnlocked(unlocked)
+        log(string.format("Progress loaded: totalScore=%d unlocked=%d/%d",
+            totalScore_, Filters.getUnlocked(), Filters.getTotal()))
+    end
+end
+
+local function saveProgress()
+    local file = File("progress.json", FILE_WRITE)
+    if not file:IsOpen() then return end
+    file:WriteString(cjson.encode({ totalScore = totalScore_ }))
+    file:Close()
+    log("Progress saved: totalScore=" .. totalScore_)
+end
+
+--- Game Over 时调用：累加本局分数，检查新解锁
+local function commitScore(roundScore)
+    if roundScore <= 0 then return end
+    local oldUnlocked = Filters.getUnlocked()
+    totalScore_ = totalScore_ + roundScore
+    local newUnlocked = math.floor(totalScore_ / UNLOCK_COST) + 1
+    Filters.setUnlocked(newUnlocked)
+    saveProgress()
+    if Filters.getUnlocked() > oldUnlocked then
+        log(string.format("NEW FILTER UNLOCKED! Now %d/%d",
+            Filters.getUnlocked(), Filters.getTotal()))
+    end
+end
 
 -- ============================================================================
 -- 常量
@@ -148,7 +201,10 @@ local flipCountLabelRef_ = nil -- 翻转倒计时标签
 -- Game Over 用 NanoVG 绘制，不用 UI 面板
 
 -- 游戏状态
-local gameState = "title"  -- "title" | "playing" | "gameover"
+local gameState = "title"  -- "title" | "playing" | "paused" | "gameover"
+-- 暂停菜单
+local pauseMenuIndex_ = 1   -- 当前选中项 (1=返回游戏, 2=重新开始, 3=切换滤镜)
+local PAUSE_ITEMS = { "RESUME", "RETRY", "FILTER" }
 local score = 0
 local level = 1
 local linesCleared = 0      -- 总消行数（用于升级）
@@ -179,14 +235,9 @@ local teleCtrlDir = DIR_DOWN
 local teleCtrlDropTimer = 0
 local TELE_CTRL_DROP_INTERVAL = 0.12  -- 传送方块自动下落很快
 
--- 日志
-local LOG = true
-local function log(...)
-    if LOG then print("[RE:Flip]", ...) end
-end
-
 -- 防抖：防止手机触摸多次触发
 local gameTime_ = 0
+local titleTrails_ = nil   -- 标题拖影动画组
 local COOLDOWN = 0.18  -- 秒
 local lastRotateTime_ = -1
 local lastHardDropTime_ = -1
@@ -566,7 +617,7 @@ local function checkAndClearLines()
     local gained = math.floor(lineBonus * level * comboBonus)
     score = score + gained
     linesCleared = linesCleared + totalCleared
-    level = math.floor(linesCleared / 5) + 1
+    level = math.floor(linesCleared / 3) + 1
     log(string.format("Score +%d (lines=%d combo=%d level=%d) total=%d",
         gained, totalCleared, combo, level, score))
     updateScoreDisplay()
@@ -742,6 +793,7 @@ local function triggerGameOver()
     gameState = "gameover"
     curType = 0  -- 停止渲染当前方块
     playSfx("gameover")
+    commitScore(score)
     log(string.format("=== GAME OVER === Score: %d  Level: %d  Lines: %d", score, level, linesCleared))
 end
 
@@ -766,7 +818,7 @@ function checkForChainReaction()
         local gained = math.floor(lineBonus * level * comboBonus)
         score = score + gained
         linesCleared = linesCleared + totalCleared
-        level = math.floor(linesCleared / 5) + 1
+        level = math.floor(linesCleared / 3) + 1
         updateScoreDisplay()
 
         animClearRows = {}
@@ -960,6 +1012,38 @@ local function advanceTutorial()
 end
 
 --- 从标题屏开始游戏
+-- 初始化标题拖影动画
+local function initTitleTrails()
+    -- 坐标使用相对于 midX/midY 的偏移，渲染时动态设置绝对坐标
+    titleTrails_ = Anim.createTrailGroup({
+        {   -- "RE" 从左侧滑入
+            text = "RE", font = "sans", fontSize = 32,
+            color = {0, 240, 240, 255},
+            x = 0, y = -50,          -- 相对 midX/midY 的偏移
+            offsetX = -80, offsetY = 0,
+            duration = 0.7,
+            shadowLayers = 5,
+            darken = 0.3,
+            ease = "quint",
+        },
+        {   -- ":Flip" 从右侧滑入
+            text = ":Flip", font = "sans", fontSize = 18,
+            color = {255, 180, 50, 255},
+            x = 0, y = -18,
+            offsetX = 80, offsetY = 0,
+            duration = 0.7,
+            shadowLayers = 5,
+            darken = 0.3,
+            ease = "quint",
+        },
+    }, 0.2)  -- 级联延迟 0.2s
+    -- 保存相对坐标，渲染时动态换算为绝对坐标
+    for _, trail in ipairs(titleTrails_) do
+        trail._relX = trail.x
+        trail._relY = trail.y
+    end
+end
+
 local function startGame()
     if tutorial_.active then
         advanceTutorial()
@@ -1384,7 +1468,7 @@ function PixelInfoPanel:Render(nvg)
     -- 标题文字（面板顶部）
     if self._title ~= "" then
         nvgFontFace(nvg, "sans")
-        nvgFontSize(nvg, 7)
+        nvgFontSize(nvg, 10)
         nvgTextAlign(nvg, NVG_ALIGN_CENTER + NVG_ALIGN_TOP)
         nvgFillColor(nvg, nvgRGBA(bc[1], bc[2], bc[3], 255))
         nvgText(nvg, bx + bw / 2, by + edge + 3, self._title)
@@ -1743,6 +1827,126 @@ function GameBoard:Render(nvg)
         end
     end
 
+    -- ── 暂停菜单覆盖层 ──
+    if gameState == "paused" then
+        -- 半透明黑色遮罩
+        nvgBeginPath(nvg)
+        nvgRect(nvg, ox, oy, BOARD_W, BOARD_H)
+        nvgFillColor(nvg, nvgRGBA(0, 0, 0, 180))
+        nvgFill(nvg)
+
+        local midX = ox + BOARD_W / 2
+        local midY = oy + BOARD_H / 2
+
+        -- 标题 "PAUSED"
+        nvgFontFace(nvg, "sans")
+        nvgTextAlign(nvg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+        nvgFontSize(nvg, 20)
+        nvgFillColor(nvg, nvgRGBA(220, 220, 240, 255))
+        nvgText(nvg, midX, midY - 70, "PAUSED")
+
+        -- 菜单项
+        local labelsCN = { "返回游戏", "重新开始", "切换滤镜" }
+        local startY = midY - 24
+        local gap = 28
+
+        for i, item in ipairs(PAUSE_ITEMS) do
+            local iy = startY + (i - 1) * gap
+            local selected = (i == pauseMenuIndex_)
+
+            if selected then
+                -- 选中项高亮背景
+                local bgW = BOARD_W * 0.7
+                nvgBeginPath(nvg)
+                nvgRoundedRect(nvg, midX - bgW / 2, iy - 11, bgW, 22, 2)
+                nvgFillColor(nvg, nvgRGBA(180, 40, 40, 160))
+                nvgFill(nvg)
+            end
+
+            nvgFontFace(nvg, "zpix")
+            nvgFontSize(nvg, 16)
+            nvgTextAlign(nvg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+
+            if selected then
+                nvgFillColor(nvg, nvgRGBA(255, 255, 255, 255))
+            else
+                nvgFillColor(nvg, nvgRGBA(180, 60, 60, 255))
+            end
+
+            local text
+            if item == "FILTER" and selected then
+                text = "◀ " .. Filters.getName() .. " ▶"
+            elseif item == "FILTER" and Filters.getUnlocked() <= 1 then
+                text = "切换滤镜 🔒"
+            else
+                text = labelsCN[i]
+            end
+
+            nvgText(nvg, midX, iy, text)
+        end
+
+        -- ── 进度区域 ──
+        local progY = startY + #PAUSE_ITEMS * gap + 20
+        local unlocked = Filters.getUnlocked()
+        local total = Filters.getTotal()
+
+        -- "✦ PROGRESS" 标题
+        nvgFontFace(nvg, "sans")
+        nvgFontSize(nvg, 12)
+        nvgTextAlign(nvg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+        nvgFillColor(nvg, nvgRGBA(255, 80, 80, 255))
+        nvgText(nvg, midX, progY, "* PROGRESS")
+
+        -- 累计分数 / 下一解锁门槛
+        progY = progY + 20
+        nvgFontFace(nvg, "sans")
+        nvgFontSize(nvg, 16)
+        nvgFillColor(nvg, nvgRGBA(220, 220, 240, 255))
+        local curTotal = totalScore_ + score  -- 含本局进行中的分数
+        if unlocked >= total then
+            nvgText(nvg, midX, progY, string.format("%d ALL", curTotal))
+        else
+            local nextGoal = unlocked * UNLOCK_COST
+            nvgText(nvg, midX, progY, string.format("%d / %d", curTotal, nextGoal))
+        end
+
+        -- 进度条
+        progY = progY + 18
+        local barW = BOARD_W * 0.6
+        local barH = 8
+        local barX = midX - barW / 2
+
+        -- 背景条
+        nvgBeginPath(nvg)
+        nvgRoundedRect(nvg, barX, progY, barW, barH, 2)
+        nvgFillColor(nvg, nvgRGBA(220, 220, 240, 200))
+        nvgFill(nvg)
+
+        -- 填充条
+        local progress
+        if unlocked >= total then
+            progress = 1.0
+        else
+            local nextGoal = unlocked * UNLOCK_COST
+            local prevGoal = (unlocked - 1) * UNLOCK_COST
+            progress = math.min(1.0, (curTotal - prevGoal) / (nextGoal - prevGoal))
+        end
+        if progress > 0 then
+            nvgBeginPath(nvg)
+            nvgRoundedRect(nvg, barX, progY, barW * progress, barH, 2)
+            nvgFillColor(nvg, nvgRGBA(220, 50, 50, 255))
+            nvgFill(nvg)
+        end
+
+        -- 已解锁 / 总数 提示
+        progY = progY + 18
+        nvgFontFace(nvg, "zpix")
+        nvgFontSize(nvg, 12)
+        nvgFillColor(nvg, nvgRGBA(140, 140, 160, 180))
+        nvgTextAlign(nvg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+        nvgText(nvg, midX, progY, string.format("滤镜 %d/%d 已解锁", unlocked, total))
+    end
+
     -- Game Over 覆盖层（NanoVG 绘制）
     if gameState == "gameover" then
         -- 半透明黑色遮罩
@@ -1757,12 +1961,12 @@ function GameBoard:Render(nvg)
         -- GAME OVER 文字
         nvgFontFace(nvg, "sans")
         nvgTextAlign(nvg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
-        nvgFontSize(nvg, 16)
+        nvgFontSize(nvg, 22)
         nvgFillColor(nvg, nvgRGBA(255, 80, 80, 255))
-        nvgText(nvg, midX, midY - 30, "GAME OVER")
+        nvgText(nvg, midX, midY - 36, "GAME OVER")
 
         -- 最终分数
-        nvgFontSize(nvg, 8)
+        nvgFontSize(nvg, 14)
         nvgFillColor(nvg, nvgRGBA(200, 200, 220, 255))
         nvgText(nvg, midX, midY + 4,
             string.format("Score:%d Lv:%d",
@@ -1770,9 +1974,9 @@ function GameBoard:Render(nvg)
 
         -- 重启提示（用 zpix 显示中文）
         nvgFontFace(nvg, "zpix")
-        nvgFontSize(nvg, 14)
+        nvgFontSize(nvg, 16)
         nvgFillColor(nvg, nvgRGBA(180, 180, 200, 200))
-        nvgText(nvg, midX, midY + 24, "按R/点击重来")
+        nvgText(nvg, midX, midY + 30, "按R/点击重来")
     end
 
     -- 标题屏覆盖层
@@ -1786,24 +1990,21 @@ function GameBoard:Render(nvg)
         local midX = ox + BOARD_W / 2
         local midY = oy + BOARD_H / 2
 
-        nvgFontFace(nvg, "sans")
-        nvgTextAlign(nvg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
-
-        -- "RE" 大标题
-        nvgFontSize(nvg, 32)
-        nvgFillColor(nvg, nvgRGBA(0, 240, 240, 255))
-        nvgText(nvg, midX, midY - 50, "RE")
-
-        -- ":Flip" 副标题
-        nvgFontSize(nvg, 18)
-        nvgFillColor(nvg, nvgRGBA(255, 180, 50, 255))
-        nvgText(nvg, midX, midY - 18, ":Flip")
+        -- 拖影动画绘制标题
+        if titleTrails_ then
+            -- 动态设置绝对坐标（相对偏移 + midX/midY）
+            for _, trail in ipairs(titleTrails_) do
+                trail.x = midX + trail._relX
+                trail.y = midY + trail._relY
+            end
+            Anim.drawAll(nvg, titleTrails_)
+        end
 
         -- 闪烁提示（用 zpix 显示中文）
         local blink = math.floor(gameTime_ * 2.5) % 2  -- 2.5Hz 闪烁
         if blink == 0 then
             nvgFontFace(nvg, "zpix")
-            nvgFontSize(nvg, 14)
+            nvgFontSize(nvg, 16)
             nvgFillColor(nvg, nvgRGBA(200, 200, 220, 220))
             nvgText(nvg, midX, midY + 30, "点击/回车开始")
         end
@@ -1870,6 +2071,19 @@ function GameBoard:Render(nvg)
         nvgText(nvg, midX - 60 - arrowBounce, midY - 60, "▸")
         nvgText(nvg, midX + 60 + arrowBounce, midY - 60, "◂")
     end
+
+    -- 滤镜名称指示器（棋盘右上角，bypass 保护不受滤镜影响）
+    Filters.bypass(function()
+        local fIdx, fTotal = Filters.getInfo()
+        if fIdx > 1 then  -- 非 Original 时才显示
+            nvgFontFace(nvg, "zpix")
+            nvgFontSize(nvg, 8)
+            nvgTextAlign(nvg, NVG_ALIGN_RIGHT + NVG_ALIGN_TOP)
+            nvgFillColor(nvg, nvgRGBA(180, 180, 200, 160))
+            nvgText(nvg, ox + BOARD_W - 4, oy + 4,
+                string.format("[%d/%d] %s", fIdx, fTotal, Filters.getName()))
+        end
+    end)
 
     -- CRT 扫描线效果（每隔 3px 画 1px 暗线，更明显）
     nvgFillColor(nvg, nvgRGBA(0, 0, 0, 70))
@@ -2065,17 +2279,17 @@ local function createLeftPanel()
     -- 分数标签
     scoreLabelRef_ = UI.Label {
         text = "0",
-        fontSize = 10,
+        fontSize = 16,
         fontColor = { 255, 255, 255, 255 },
     }
     levelLabelRef_ = UI.Label {
         text = "Lv1",
-        fontSize = 8,
+        fontSize = 12,
         fontColor = { 180, 220, 255, 255 },
     }
     comboLabelRef_ = UI.Label {
         text = "",
-        fontSize = 10,
+        fontSize = 14,
         fontColor = { 255, 220, 80, 255 },
     }
 
@@ -2092,6 +2306,7 @@ local function createLeftPanel()
         children = {
             -- 上方：标题 + 分数（SNES 金边框风格）
             UI.Panel {
+                width = "100%",
                 alignItems = "center",
                 gap = 6,
                 children = {
@@ -2107,8 +2322,8 @@ local function createLeftPanel()
                         borderColor = { 180, 60, 60 },   -- 红色边框
                         bgColor = { 40, 10, 10, 220 },
                         children = {
-                            UI.Label { text = "RE", fontSize = 16, fontColor = { 255, 80, 80, 255 } },
-                            UI.Label { text = "Flip", fontSize = 10, fontColor = { 255, 180, 100, 255 } },
+                            UI.Label { text = "RE", fontSize = 22, fontColor = { 255, 80, 80, 255 } },
+                            UI.Label { text = "Flip", fontSize = 14, fontColor = { 255, 180, 100, 255 } },
                         },
                     },
                     -- 分数面板
@@ -2146,6 +2361,7 @@ local function createLeftPanel()
             },
             -- 下方控制键
             UI.Panel {
+                width = "100%",
                 alignItems = "center",
                 gap = 8,
                 children = {
@@ -2185,13 +2401,13 @@ local function createRightPanel()
     -- 下一方向标签
     nextDirLabelRef_ = UI.Label {
         text = "▼",
-        fontSize = 20,
+        fontSize = 26,
         fontColor = { 255, 160, 80, 255 },
     }
     -- 翻转倒计时标签
     flipCountLabelRef_ = UI.Label {
         text = tostring(FLIP_FORCE_THRESHOLD),
-        fontSize = 12,
+        fontSize = 16,
         fontColor = { 180, 180, 200, 255 },
     }
 
@@ -2208,6 +2424,7 @@ local function createRightPanel()
         children = {
             -- 上方：FLIP 按钮 + 方向/倒计时面板
             UI.Panel {
+                width = "100%",
                 alignItems = "center",
                 gap = 6,
                 children = {
@@ -2227,14 +2444,28 @@ local function createRightPanel()
                         bgColor = { 10, 20, 35, 220 },
                         children = {
                             nextDirLabelRef_,
-                            UI.Label { text = "FLIP IN", fontSize = 6, fontColor = { 120, 120, 150, 255 } },
+                            UI.Label { text = "FLIP IN", fontSize = 10, fontColor = { 120, 120, 150, 255 } },
                             flipCountLabelRef_,
                         },
+                    },
+                    -- 暂停按钮（手机端用）
+                    PixelButton {
+                        label = "暂停",
+                        width = "70%",
+                        maxWidth = 70,
+                        aspectRatio = 1,
+                        onClick = function(self)
+                            if gameState == "playing" and animState == "none" then
+                                gameState = "paused"
+                                pauseMenuIndex_ = 1
+                            end
+                        end,
                     },
                 },
             },
             -- 下方控制键
             UI.Panel {
+                width = "100%",
                 alignItems = "center",
                 gap = 8,
                 children = {
@@ -2305,6 +2536,11 @@ end
 function HandleUpdate(eventType, eventData)
     local dt = eventData["TimeStep"]:GetFloat()
     gameTime_ = gameTime_ + dt
+
+    -- 标题拖影动画更新
+    if titleTrails_ and gameState == "title" then
+        Anim.updateAll(titleTrails_, dt)
+    end
 
     -- 引导层淡入更新
     if tutorial_.active then
@@ -2399,6 +2635,50 @@ function HandleKeyDown(eventType, eventData)
         return
     end
 
+    -- ── 暂停菜单 ──
+    if gameState == "paused" then
+        if key == KEY_UP or key == KEY_W then
+            pauseMenuIndex_ = pauseMenuIndex_ - 1
+            if pauseMenuIndex_ < 1 then pauseMenuIndex_ = #PAUSE_ITEMS end
+        elseif key == KEY_DOWN or key == KEY_S then
+            pauseMenuIndex_ = pauseMenuIndex_ + 1
+            if pauseMenuIndex_ > #PAUSE_ITEMS then pauseMenuIndex_ = 1 end
+        elseif key == KEY_LEFT or key == KEY_A then
+            -- 选中 FILTER 时切换上一个滤镜
+            if PAUSE_ITEMS[pauseMenuIndex_] == "FILTER" then
+                Filters.prev()
+            end
+        elseif key == KEY_RIGHT or key == KEY_D then
+            -- 选中 FILTER 时切换下一个滤镜
+            if PAUSE_ITEMS[pauseMenuIndex_] == "FILTER" then
+                Filters.next()
+            end
+        elseif key == KEY_RETURN then
+            local item = PAUSE_ITEMS[pauseMenuIndex_]
+            if item == "RESUME" then
+                gameState = "playing"
+            elseif item == "RETRY" then
+                gameState = "playing"
+                restartGame()
+            elseif item == "FILTER" then
+                -- Enter on filter = resume
+                gameState = "playing"
+            end
+        elseif key == KEY_ESCAPE then
+            gameState = "playing"
+        end
+        return
+    end
+
+    -- ── playing 状态下 Enter 暂停 ──
+    if key == KEY_RETURN or key == KEY_ESCAPE then
+        if gameState == "playing" and animState == "none" then
+            gameState = "paused"
+            pauseMenuIndex_ = 1
+            return
+        end
+    end
+
     -- 传送方块控制阶段：只允许左右移动
     if animState == "teleport_control" then
         if key == KEY_LEFT or key == KEY_A then
@@ -2481,6 +2761,13 @@ function Start()
 
     SubscribeToEvent("Update", "HandleUpdate")
     SubscribeToEvent("KeyDown", "HandleKeyDown")
+
+    -- 初始化标题拖影动画（需要在 CELL_SIZE 计算之后）
+    initTitleTrails()
+
+    -- 安装全屏滤镜（包装 nvgRGBA，所有渲染自动经过滤镜）
+    loadProgress()
+    Filters.installGlobal()
 
     log("=== RE:Flip Started ===")
 end
